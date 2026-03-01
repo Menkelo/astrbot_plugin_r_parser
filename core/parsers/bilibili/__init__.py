@@ -21,6 +21,8 @@ from ..base import (
     ParseException,
     handle,
 )
+
+# 你前面已经拆分过评论与码率模块，这里直接复用
 from .comment_renderer import BiliCommentRenderer
 from .comment_service import BiliCommentService
 from .stream_selector import BiliStreamSelector
@@ -50,7 +52,7 @@ class BilibiliParser(BaseParser):
         self._video_info_cache: dict[str, tuple[float, dict]] = {}
         self._playurl_cache: dict[str, tuple[float, dict]] = {}
 
-        # 分层组件
+        # 评论过滤配置
         comment_conf = config.get("comment_filter", {})
         if not isinstance(comment_conf, dict):
             comment_conf = {}
@@ -132,6 +134,85 @@ class BilibiliParser(BaseParser):
 
     # endregion
 
+    # region CDN候选增强（关键修复）
+
+    @staticmethod
+    def _collect_stream_urls(item: dict) -> list[str]:
+        urls: list[str] = []
+
+        base = item.get("baseUrl") or item.get("base_url")
+        if isinstance(base, str) and base:
+            urls.append(base)
+
+        backups = item.get("backupUrl") or item.get("backup_url") or []
+        if isinstance(backups, list):
+            for u in backups:
+                if isinstance(u, str) and u:
+                    urls.append(u)
+
+        # 去重保序
+        seen = set()
+        uniq = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                uniq.append(u)
+
+        # 优先非 mcdn / 非 8082
+        def score(u: str) -> tuple[int, int]:
+            bad_port = 1 if ":8082" in u else 0
+            bad_host = 1 if "mcdn" in u else 0
+            return (bad_port, bad_host)
+
+        uniq.sort(key=score)
+        return uniq
+
+    def _select_best_stream_candidates(self, data: dict, duration: int, limit_mb: int) -> tuple[list[str], list[str]]:
+        """
+        返回 (video_candidates, audio_candidates)
+        """
+        if "dash" not in data:
+            if "durl" in data and data["durl"]:
+                u = data["durl"][0].get("url")
+                return ([u] if u else []), []
+            return [], []
+
+        dash = data["dash"]
+        video_streams = [v for v in dash.get("video", []) if v.get("id", 0) <= 64]
+        audio_streams = dash.get("audio", [])
+
+        if not video_streams:
+            return [], []
+
+        audio_size_mb = 0.0
+        audio_candidates: list[str] = []
+
+        if audio_streams:
+            best_audio = audio_streams[0]
+            audio_candidates = self._collect_stream_urls(best_audio)
+            bandwidth = best_audio.get("bandwidth", 128000)
+            audio_size_mb = (bandwidth / 8 * duration) / 1024 / 1024
+
+        remaining_mb = max(limit_mb - audio_size_mb, 0)
+
+        video_streams.sort(key=lambda x: x.get("id", 0), reverse=True)
+        selected_item = None
+
+        for v in video_streams:
+            bandwidth = v.get("bandwidth", 0)
+            est_size_mb = (bandwidth / 8 * duration) / 1024 / 1024
+            if est_size_mb * 1.25 <= remaining_mb:
+                selected_item = v
+                break
+
+        if selected_item is None:
+            selected_item = video_streams[-1]
+
+        video_candidates = self._collect_stream_urls(selected_item)
+        return video_candidates, audio_candidates
+
+    # endregion
+
     async def parse_video(
         self,
         *,
@@ -161,7 +242,6 @@ class BilibiliParser(BaseParser):
 
         limit_mb = self.max_size_mb
 
-        # 下载地址与评论并发
         task_play_url = self._get_playurl_cached(
             video, page_info.index, f"{video_info.bvid}:{page_info.index}"
         )
@@ -173,11 +253,11 @@ class BilibiliParser(BaseParser):
         )
         play_url_data, comment_imgs = await asyncio.gather(task_play_url, task_comments)
 
-        final_v_url, final_a_url = self.stream_selector.select_best_stream_offline(
+        v_candidates, a_candidates = self._select_best_stream_candidates(
             play_url_data, page_info.duration, limit_mb
         )
 
-        if not final_v_url:
+        if not v_candidates:
             raise SizeLimitException(f"即使是最低画质也超过了限制 ({limit_mb}MB)")
 
         async def download_video_task():
@@ -193,23 +273,41 @@ class BilibiliParser(BaseParser):
             download_headers = self.headers.copy()
             download_headers["Referer"] = url
 
-            if final_a_url:
-                return await self.downloader.download_av_and_merge(
-                    final_v_url,
-                    final_a_url,
-                    output_path=output_path,
-                    ext_headers=download_headers,
-                    max_size_mb=limit_mb,
-                )
-            return await self.downloader.streamd(
-                final_v_url,
-                file_name=output_path.name,
-                ext_headers=download_headers,
-                max_size_mb=limit_mb,
-            )
+            last_err: Exception | None = None
+
+            # 先尝试音视频合并候选
+            if a_candidates:
+                for v_url in v_candidates:
+                    for a_url in a_candidates:
+                        try:
+                            return await self.downloader.download_av_and_merge(
+                                v_url,
+                                a_url,
+                                output_path=output_path,
+                                ext_headers=download_headers,
+                                max_size_mb=limit_mb,
+                            )
+                        except Exception as e:
+                            last_err = e
+                            continue
+
+            # 再尝试纯视频候选
+            for v_url in v_candidates:
+                try:
+                    return await self.downloader.streamd(
+                        v_url,
+                        file_name=output_path.name,
+                        ext_headers=download_headers,
+                        max_size_mb=limit_mb,
+                    )
+                except Exception as e:
+                    last_err = e
+                    continue
+
+            raise ParseException(f"B站媒体下载失败（已尝试全部CDN候选）: {last_err}")
 
         video_content = self.create_video_content(
-            asyncio.create_task(download_video_task()),
+            asyncio.create_task(download_video_task(), name=f"bili_dl_{video_info.bvid}_{page_num}"),
             cover_url=None,
             duration=page_info.duration,
         )
