@@ -1,6 +1,9 @@
 name: astrbot_plugin_r_parser
-display_name: R-Parser (Core)
-desc: 全能链接解析插件，支持多平台解析，具备自动防抖及资源限制保护特性。
-version: 1.1.0
-author: jengaklll-a11y
-repo: https://github.com/jengaklll-a11y/astrbot_plugin_r_parser
+display_name: R-Parser
+desc: 一个面向B站、抖音、快手、微博、小红书的解析插件，支持自动识别消息中的链接并提取媒体内容（视频 / 图片 / 图文 / 动态视频等）
+version: 1.2.0
+author: Menkelo
+support_platforms: 
+  - aiocqhttp
+astrbot_version: ">=4.14.0"
+repo: https://github.com/Menkelo/astrbot_plugin_r_parser
