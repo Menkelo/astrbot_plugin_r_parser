@@ -1,30 +1,19 @@
-from .base import BaseParser, Downloader, ParseException, handle
-from .acfun import AcfunParser
+from .base import BaseParser, ParseException, handle
 from .bilibili import BilibiliParser
 from .douyin import DouyinParser
 from .kuaishou import KuaiShouParser
-from .ncm import NCMParser
-from .nga import NGAParser
-from .tiktok import TikTokParser
-from .twitter import TwitterParser
 from .weibo import WeiboParser
 from .xiaohongshu import XiaoHongShuParser
-from .youtube import YouTubeParser
+from ..download import Downloader
 
 __all__ = [
     "BaseParser",
     "Downloader",
     "ParseException",
     "handle",
-    "AcfunParser",
     "BilibiliParser",
     "DouyinParser",
     "KuaiShouParser",
-    "NCMParser",
-    "NGAParser",
-    "TikTokParser",
-    "TwitterParser",
     "WeiboParser",
     "XiaoHongShuParser",
-    "YouTubeParser",
 ]
