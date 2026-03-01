@@ -30,26 +30,23 @@ class MediaContent:
 @dataclass(repr=False, slots=True)
 class AudioContent(MediaContent):
     """音频内容"""
-
     duration: float = 0.0
 
 
 @dataclass(repr=False, slots=True)
 class FileContent(MediaContent):
     """文件内容"""
-
     name: str | None = None
-    """文件名"""
 
 
 @dataclass(repr=False, slots=True)
 class VideoContent(MediaContent):
     """视频内容"""
-
     cover: Path | Task[Path] | None = None
-    """视频封面"""
     duration: float = 0.0
-    """时长 单位: 秒"""
+    
+    # === 新增：是否强制作为文件上传 ===
+    is_file_upload: bool = False
 
     async def get_cover_path(self) -> Path | None:
         if self.cover is None:
@@ -75,25 +72,20 @@ class VideoContent(MediaContent):
 @dataclass(repr=False, slots=True)
 class ImageContent(MediaContent):
     """图片内容"""
-
     pass
 
 
 @dataclass(repr=False, slots=True)
 class DynamicContent(MediaContent):
-    """动态内容 视频格式 后续转 gif"""
-
+    """动态内容"""
     gif_path: Path | None = None
 
 
 @dataclass(repr=False, slots=True)
 class GraphicsContent(MediaContent):
-    """图文内容 渲染时文字在前 图片在后"""
-
+    """图文内容"""
     text: str | None = None
-    """图片前的文本内容"""
     alt: str | None = None
-    """图片描述 渲染时居中显示"""
 
     def __repr__(self) -> str:
         repr = f"GraphicsContent(path={repr_path_task(self.path_task)}"
@@ -106,24 +98,15 @@ class GraphicsContent(MediaContent):
 
 @dataclass(slots=True)
 class Platform:
-    """平台信息"""
-
     name: str
-    """ 平台名称 """
     display_name: str
-    """ 平台显示名称 """
 
 
 @dataclass(repr=False, slots=True)
 class Author:
-    """作者信息"""
-
     name: str
-    """作者名称"""
     avatar: Path | Task[Path] | None = None
-    """作者头像 URL 或本地路径"""
     description: str | None = None
-    """作者个性签名等"""
 
     async def get_avatar_path(self) -> Path | None:
         if self.avatar is None:
@@ -144,30 +127,21 @@ class Author:
 
 @dataclass(repr=False, slots=True)
 class ParseResult:
-    """完整的解析结果"""
-
     platform: Platform
-    """平台信息"""
     author: Author | None = None
-    """作者信息"""
     title: str | None = None
-    """标题"""
     text: str | None = None
-    """文本内容"""
     timestamp: int | None = None
-    """发布时间戳, 秒"""
     url: str | None = None
-    """来源链接"""
+    
     contents: list[MediaContent] = field(default_factory=list)
-    """媒体内容"""
+    comment_contents: list[MediaContent] = field(default_factory=list)
+
     extra: dict[str, Any] = field(default_factory=dict)
-    """额外信息"""
     repost: "ParseResult | None" = None
-    """转发的内容"""
 
     @property
     def header(self) -> str | None:
-        """头信息 仅用于 default render"""
         header = self.platform.display_name
         if self.author:
             header += f" @{self.author.name}"
@@ -188,32 +162,7 @@ class ParseResult:
         return self.extra.get("info")
 
     @property
-    def video_contents(self) -> list[VideoContent]:
-        return [cont for cont in self.contents if isinstance(cont, VideoContent)]
-
-    @property
-    def img_contents(self) -> list[ImageContent]:
-        return [cont for cont in self.contents if isinstance(cont, ImageContent)]
-
-    @property
-    def audio_contents(self) -> list[AudioContent]:
-        return [cont for cont in self.contents if isinstance(cont, AudioContent)]
-
-    @property
-    def file_contents(self) -> list[FileContent]:
-        return [cont for cont in self.contents if isinstance(cont, FileContent)]
-
-    @property
-    def dynamic_contents(self) -> list[DynamicContent]:
-        return [cont for cont in self.contents if isinstance(cont, DynamicContent)]
-
-    @property
-    def graphics_contents(self) -> list[GraphicsContent]:
-        return [cont for cont in self.contents if isinstance(cont, GraphicsContent)]
-
-    @property
     async def cover_path(self) -> Path | None:
-        """获取封面路径"""
         for cont in self.contents:
             if isinstance(cont, VideoContent):
                 return await cont.get_cover_path()
@@ -221,7 +170,6 @@ class ParseResult:
 
     @property
     def formatted_datetime(self, fmt: str = "%Y-%m-%d %H:%M:%S") -> str | None:
-        """格式化时间戳"""
         return (
             datetime.fromtimestamp(self.timestamp).strftime(fmt)
             if self.timestamp is not None
@@ -237,6 +185,7 @@ class ParseResult:
             f"url: {self.url}, "
             f"author: {self.author}, "
             f"contents: {self.contents}, "
+            f"comments: {self.comment_contents}, "
             f"extra: {self.extra}, "
             f"repost: <<<<<<<{self.repost}>>>>>>"
         )
@@ -246,6 +195,7 @@ class ParseResultKwargs(TypedDict, total=False):
     title: str | None
     text: str | None
     contents: list[MediaContent]
+    comment_contents: list[MediaContent]
     timestamp: int | None
     url: str | None
     author: Author | None
