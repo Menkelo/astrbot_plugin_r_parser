@@ -19,7 +19,8 @@ class CacheCleaner:
     JOBNAME = "CacheCleaner"
 
     def __init__(self, context: Context, config: AstrBotConfig):
-        self.clean_cron = config["clean_cron"]
+        # 内嵌清理周期：每天凌晨 2:30
+        self.clean_cron = "30 2 * * *"
         self.cache_dir = Path(config["cache_dir"])
 
         tz = context.get_config().get("timezone")
