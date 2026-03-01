@@ -1,75 +1,138 @@
 import re
+import asyncio
 from random import choice
 from typing import ClassVar, TypeAlias
 
 import msgspec
 from msgspec import Struct, field
 
+from astrbot.api import logger
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
-from ..data import Platform
+from ..data import Platform, VideoContent
 from ..download import Downloader
 from .base import BaseParser, ParseException, handle
 
 
 class KuaiShouParser(BaseParser):
-    """快手解析器"""
-
-    # 平台信息
     platform: ClassVar[Platform] = Platform(name="kuaishou", display_name="快手")
 
     def __init__(self, config: AstrBotConfig, downloader: Downloader):
         super().__init__(config, downloader)
-        self.ios_headers["Referer"] = "https://v.kuaishou.com/"
+        self.ios_headers.update({
+            "Referer": "https://v.kuaishou.com/",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 13_2_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.0.3 Mobile/15E148 Safari/604.1"
+        })
 
-    # https://v.kuaishou.com/2yAnzeZ
     @handle("v.kuaishou", r"v\.kuaishou\.com/[A-Za-z\d._?%&+\-=/#]+")
-    # https://www.kuaishou.com/short-video/3xhjgcmir24m4nm
     @handle("kuaishou", r"(?:www\.)?kuaishou\.com/[A-Za-z\d._?%&+\-=/#]+")
-    # https://v.m.chenzhongtech.com/fw/photo/3xburnkmj3auazc
     @handle("chenzhongtech", r"(?:v\.m\.)?chenzhongtech\.com/fw/[A-Za-z\d._?%&+\-=/#]+")
     async def _parse_v_kuaishou(self, searched: re.Match[str]):
-        # 从匹配对象中获取原始URL
         url = f"https://{searched.group(0)}"
-        real_url = await self.get_redirect_url(url, headers=self.ios_headers)
+        
+        real_url = None
+        last_err = None
+        
+        for i in range(3):
+            try:
+                resp = await self.client.get(
+                    url, 
+                    headers=self.ios_headers, 
+                    allow_redirects=False, 
+                    timeout=30
+                )
+                if resp.status_code in (301, 302):
+                    real_url = resp.headers.get("Location")
+                else:
+                    real_url = str(resp.url)
+                
+                if real_url:
+                    break
+            except Exception as e:
+                last_err = e
+                logger.debug(f"[快手] 获取重定向失败 (尝试 {i+1}/3): {e}")
+                await asyncio.sleep(1)
 
-        if len(real_url) <= 0:
-            raise ParseException("failed to get location url from url")
+        if not real_url:
+            raise ParseException(f"获取重定向失败: {last_err}")
 
-        # /fw/long-video/ 返回结果不一样, 统一替换为 /fw/photo/ 请求
         real_url = real_url.replace("/fw/long-video/", "/fw/photo/")
+        logger.debug(f"[快手] 目标页面: {real_url}")
 
-        async with self.client.get(real_url, headers=self.ios_headers) as resp:
+        response_text = ""
+        try:
+            resp = await self.client.get(real_url, headers=self.ios_headers, timeout=30)
+            if resp.status_code >= 400:
+                raise ParseException(f"获取页面失败 {resp.status_code}")
+            response_text = resp.text
+        except Exception as e:
+            raise ParseException(f"网络请求失败: {e}")
 
-            if resp.status >= 400:
-                raise ParseException(f"获取页面失败 {resp.status}")
-            response_text = await resp.text()
+        try:
+            pattern = r"window\.INIT_STATE\s*=\s*(.*?)</script>"
+            matched = re.search(pattern, response_text)
+            if matched:
+                json_str = matched.group(1).strip()
+                init_state = msgspec.json.decode(json_str, type=KuaishouInitState)
+                photo = next(
+                    (d.photo for d in init_state.values() if d.photo is not None), None
+                )
+                if photo:
+                    return self._build_result_from_photo(photo)
+        except Exception as e:
+            logger.debug(f"[快手] INIT_STATE 解析失败: {e}，尝试正则提取")
 
-        pattern = r"window\.INIT_STATE\s*=\s*(.*?)</script>"
-        matched = re.search(pattern, response_text)
+        video_url = None
+        if match := re.search(r'"srcNoMark":"(https?://[^"]+)"', response_text):
+            video_url = match.group(1).encode('utf-8').decode('unicode_escape')
+        elif match := re.search(r'"src":"(https?://[^"]+)"', response_text):
+            video_url = match.group(1).encode('utf-8').decode('unicode_escape')
+            
+        if video_url:
+            title = "快手视频"
+            if match := re.search(r'"caption":"([^"]+)"', response_text):
+                try: title = match.group(1).encode('utf-8').decode('unicode_escape')
+                except: pass
+            
+            author = "快手用户"
+            if match := re.search(r'"userName":"([^"]+)"', response_text):
+                try: author = match.group(1).encode('utf-8').decode('unicode_escape')
+                except: pass
+                
+            # 提纯：手动设置为 None
+            cover = None
+            
+            contents = [VideoContent(
+                self.downloader.download_video(video_url, ext_headers=self.ios_headers),
+                None # cover task
+            )]
+            
+            return self.result(
+                title=title,
+                author=self.create_author(author),
+                contents=contents,
+                url=real_url
+            )
 
-        if not matched:
-            raise ParseException("failed to parse video JSON info from HTML")
+        raise ParseException("快手解析失败: 未找到视频信息")
 
-        json_str = matched.group(1).strip()
-        init_state = msgspec.json.decode(json_str, type=KuaishouInitState)
-        photo = next((d.photo for d in init_state.values() if d.photo is not None), None)
-        if photo is None:
-            raise ParseException("window.init_state don't contains videos or pics")
-
-        # 简洁的构建方式
+    def _build_result_from_photo(self, photo):
         contents = []
-
-        # 添加视频内容
         if video_url := photo.video_url:
-            contents.append(self.create_video_content(video_url, photo.cover_url, photo.duration))
-
-        # 添加图片内容
+            contents.append(
+                # BaseParser 已修改，create_video_content 会自动忽略传入的 cover
+                self.create_video_content(
+                    video_url, photo.cover_url, photo.duration, ext_headers=self.ios_headers
+                )
+            )
         if img_urls := photo.img_urls:
-            contents.extend(self.create_image_contents(img_urls))
+            contents.extend(
+                self.create_image_contents(img_urls, ext_headers=self.ios_headers)
+            )
 
-        # 构建作者
-        author = self.create_author(photo.name, photo.head_url)
+        author = self.create_author(
+            photo.name, photo.head_url, ext_headers=self.ios_headers
+        )
 
         return self.result(
             title=photo.caption,
@@ -77,9 +140,6 @@ class KuaiShouParser(BaseParser):
             contents=contents,
             timestamp=photo.timestamp // 1000,
         )
-
-
-
 
 
 class CdnUrl(Struct):
@@ -106,7 +166,6 @@ class ExtParams(Struct):
 
 
 class Photo(Struct):
-    # 标题
     caption: str
     timestamp: int
     duration: int = 0
@@ -136,7 +195,6 @@ class Photo(Struct):
 class TusjohData(Struct):
     result: int
     photo: Photo | None = None
-
 
 
 KuaishouInitState: TypeAlias = dict[str, TusjohData]
