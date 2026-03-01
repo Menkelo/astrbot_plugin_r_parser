@@ -1,14 +1,16 @@
-"""Parser 基类定义"""
-
 from abc import ABC
 from asyncio import Task
 from collections.abc import Callable, Coroutine
 from pathlib import Path
 from re import Match, Pattern, compile
-from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, List, Dict
 
-from aiohttp import ClientError, ClientSession, ClientTimeout
+# === 新增：引入 aiohttp 用于兜底 ===
+import aiohttp
+
+from curl_cffi.requests import AsyncSession
 from typing_extensions import Unpack
+from astrbot.api import logger
 
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
@@ -32,41 +34,28 @@ T = TypeVar("T", bound="BaseParser")
 HandlerFunc = Callable[[T, Match[str]], Coroutine[Any, Any, ParseResult]]
 KeyPatterns = list[tuple[str, Pattern[str]]]
 
-_KEY_PATTERNS = "_key_patterns"
+_PARSER_META = "_parser_meta"
 
 
-# 注册处理器装饰器
 def handle(keyword: str, pattern: str):
     """注册处理器装饰器"""
-
     def decorator(func: HandlerFunc[T]) -> HandlerFunc[T]:
-        if not hasattr(func, _KEY_PATTERNS):
-            setattr(func, _KEY_PATTERNS, [])
-
-        key_patterns: KeyPatterns = getattr(func, _KEY_PATTERNS)
-        key_patterns.append((keyword, compile(pattern)))
-
+        if not hasattr(func, _PARSER_META):
+            setattr(func, _PARSER_META, [])
+        meta = getattr(func, _PARSER_META)
+        meta.append((keyword, compile(pattern)))
         return func
-
     return decorator
 
 
 class BaseParser:
-    """所有平台 Parser 的抽象基类
-
-    子类必须实现：
-    - platform: 平台信息（包含名称和显示名称)
-    """
+    """所有平台 Parser 的抽象基类"""
 
     _registry: ClassVar[list[type["BaseParser"]]] = []
-    """ 存储所有已注册的 Parser 类 """
-
     platform: ClassVar[Platform]
-    """ 平台信息（包含名称和显示名称） """
 
-    if TYPE_CHECKING:
-        _key_patterns: ClassVar[KeyPatterns]
-        _handlers: ClassVar[dict[str, HandlerFunc]]
+    _dispatch_map: ClassVar[dict[str, str]]
+    _key_patterns: ClassVar[KeyPatterns]
 
     def __init__(
         self,
@@ -78,88 +67,68 @@ class BaseParser:
         self.android_headers = ANDROID_HEADER.copy()
         self.config = config
         self.downloader = downloader
-        # Proxy only applies to YouTube and TikTok as per configuration
-        proxy_enabled_platforms = ["youtube", "tiktok"]
-        if self.__class__.platform.name in proxy_enabled_platforms:
-            self.proxy = config.get("proxy") or None
-        else:
-            self.proxy = None
-        # 每个实例拥有独立的 session
-        self._session: ClientSession | None = None
-        self._timeout = config["common_timeout"]
+
+        self._session: AsyncSession | None = None
 
     def __init_subclass__(cls, **kwargs):
-        """自动注册子类到 _registry"""
         super().__init_subclass__(**kwargs)
-        if ABC not in cls.__bases__:  # 跳过抽象类
+        if ABC not in cls.__bases__:
             BaseParser._registry.append(cls)
 
-        cls._handlers = {}
+        cls._dispatch_map = {}
         cls._key_patterns = []
 
-        # 获取所有被 handle 装饰的方法
         for attr_name in dir(cls):
             attr = getattr(cls, attr_name)
-            if callable(attr) and hasattr(attr, _KEY_PATTERNS):
-                key_patterns: KeyPatterns = getattr(attr, _KEY_PATTERNS)
-                handler = cast(HandlerFunc, attr)
-                for keyword, pattern in key_patterns:
-                    cls._handlers[keyword] = handler
+            if callable(attr) and hasattr(attr, _PARSER_META):
+                meta = getattr(attr, _PARSER_META)
+                for keyword, pattern in meta:
+                    cls._dispatch_map[keyword] = attr_name
                     cls._key_patterns.append((keyword, pattern))
 
-        # 按关键字长度降序排序
         cls._key_patterns.sort(key=lambda x: -len(x[0]))
 
     @classmethod
     def get_all_subclass(cls) -> list[type["BaseParser"]]:
-        """获取所有已注册的 Parser 类"""
         return cls._registry
 
     @property
-    def client(self) -> ClientSession:
-        """获取当前实例的 session，惰性创建"""
-        if self._session is None or self._session.closed:
-            self._session = ClientSession(timeout=ClientTimeout(total=self._timeout))
+    def client(self) -> AsyncSession:
+        if self._session is None:
+            self._session = AsyncSession(
+                impersonate="chrome120",
+                timeout=15,
+                verify=False,
+            )
         return self._session
 
     async def close_session(self) -> None:
-        """关闭当前实例的 session"""
-        if self._session and not self._session.closed:
-            await self._session.close()
+        if self._session:
+            self._session.close()
             self._session = None
 
     async def parse(self, keyword: str, searched: Match[str]) -> ParseResult:
-        """解析 URL 提取信息
+        """解析 URL 提取信息"""
+        method_name = self._dispatch_map.get(keyword)
+        if not method_name:
+            raise ParseException(f"未找到关键词 {keyword} 对应的处理方法")
 
-        Args:
-            keyword: 关键词
-            searched: 正则表达式匹配对象，由平台对应的模式匹配得到
-
-        Returns:
-            ParseResult: 解析结果
-
-        Raises:
-            ParseException: 解析失败时抛出
-        """
-        return await self._handlers[keyword](self, searched)
+        handler = getattr(self, method_name)
+        return await handler(searched)
 
     async def parse_with_redirect(
         self,
         url: str,
         headers: dict[str, str] | None = None,
     ) -> ParseResult:
-        """先重定向再解析"""
         redirect_url = await self.get_redirect_url(url, headers=headers or self.headers)
-
         if redirect_url == url:
             raise ParseException(f"无法重定向 URL: {url}")
-
         keyword, searched = self.search_url(redirect_url)
         return await self.parse(keyword, searched)
 
     @classmethod
     def search_url(cls, url: str) -> tuple[str, Match[str]]:
-        """搜索 URL 匹配模式"""
         for keyword, pattern in cls._key_patterns:
             if keyword not in url:
                 continue
@@ -169,37 +138,98 @@ class BaseParser:
 
     @classmethod
     def result(cls, **kwargs: Unpack[ParseResultKwargs]) -> ParseResult:
-        """构建解析结果"""
         return ParseResult(platform=cls.platform, **kwargs)
+
+    async def http_get(
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        allow_redirects: bool = True,
+        timeout: int = 15,
+    ):
+        """
+        统一 GET 请求入口:
+        优先 curl_cffi；失败自动降级 aiohttp。
+        返回对象兼容常用字段: status_code / headers / url / text / content
+        """
+        headers = headers or self.headers
+        try:
+            return await self.client.get(
+                url,
+                headers=headers,
+                params=params,
+                allow_redirects=allow_redirects,
+                timeout=timeout,
+                verify=False,
+            )
+        except Exception as e:
+            logger.warning(f"curl_cffi GET失败，尝试aiohttp兜底: {e}")
+            conn = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(
+                connector=conn,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                headers=headers,
+            ) as session:
+                async with session.get(
+                    url,
+                    params=params,
+                    allow_redirects=allow_redirects,
+                ) as resp:
+                    body = await resp.read()
+
+                    class _Resp:
+                        def __init__(self):
+                            self.status_code = resp.status
+                            self.headers = dict(resp.headers)
+                            self.url = str(resp.url)
+                            self.content = body
+                            self.text = body.decode(errors="ignore")
+
+                    return _Resp()
 
     async def get_redirect_url(
         self,
         url: str,
         headers: dict[str, str] | None = None,
     ) -> str:
-        """获取重定向后的 URL, 单次重定向"""
-
         headers = headers or COMMON_HEADER.copy()
-        async with self.client.get(
-            url, headers=headers, allow_redirects=False, proxy=self.proxy
-        ) as resp:
-            if resp.status >= 400:
-                raise ClientError(f"redirect check {resp.status} {resp.reason}")
+        try:
+            resp = await self.http_get(
+                url,
+                headers=headers,
+                allow_redirects=False,
+                timeout=15,
+            )
+            if resp.status_code >= 400:
+                raise ParseException(f"redirect check {resp.status_code}")
             return resp.headers.get("Location", url)
+        except Exception as e:
+            raise ParseException(f"重定向检测失败: {e}")
 
     async def get_final_url(
         self,
         url: str,
         headers: dict[str, str] | None = None,
     ) -> str:
-        """获取重定向后的 URL, 允许多次重定向"""
         headers = headers or COMMON_HEADER.copy()
-        async with self.client.get(
-            url, headers=headers, allow_redirects=True, proxy=self.proxy
-        ) as resp:
-            if resp.status >= 400:
-                raise ClientError(f"final url check {resp.status} {resp.reason}")
+        try:
+            resp = await self.http_get(
+                url,
+                headers=headers,
+                allow_redirects=True,
+                timeout=15,
+            )
             return str(resp.url)
+        except Exception:
+            return url
+
+    async def get_search_data(self, keyword: str) -> List[Dict[str, Any]]:
+        """
+        搜索接口，返回标准化的结果列表
+        """
+        return []
 
     def create_author(
         self,
@@ -208,14 +238,7 @@ class BaseParser:
         description: str | None = None,
         ext_headers: dict[str, str] | None = None,
     ):
-        """创建作者对象"""
-
-        avatar_task = None
-        if avatar_url:
-            avatar_task = self.downloader.download_img(
-                avatar_url, ext_headers=ext_headers or self.headers, proxy=self.proxy
-            )
-        return Author(name=name, avatar=avatar_task, description=description)
+        return Author(name=name, avatar=None, description=description)
 
     def create_video_content(
         self,
@@ -224,28 +247,20 @@ class BaseParser:
         duration: float = 0.0,
         ext_headers: dict[str, str] | None = None,
     ):
-        """创建视频内容"""
-        cover_task = None
-        if cover_url:
-            cover_task = self.downloader.download_img(
-                cover_url, ext_headers=ext_headers or self.headers, proxy=self.proxy
-            )
         if isinstance(url_or_task, str):
             url_or_task = self.downloader.download_video(
-                url_or_task, ext_headers=ext_headers or self.headers, proxy=self.proxy
+                url_or_task, ext_headers=ext_headers or self.headers
             )
-
-        return VideoContent(url_or_task, cover_task, duration)
+        return VideoContent(url_or_task, None, duration)
 
     def create_image_contents(
         self,
         image_urls: list[str],
         ext_headers: dict[str, str] | None = None,
     ):
-        """创建图片内容列表"""
         contents: list[ImageContent] = []
         for url in image_urls:
-            task = self.downloader.download_img(url, ext_headers=ext_headers or self.headers, proxy=self.proxy)
+            task = self.downloader.download_img(url, ext_headers=ext_headers or self.headers)
             contents.append(ImageContent(task))
         return contents
 
@@ -254,10 +269,9 @@ class BaseParser:
         dynamic_urls: list[str],
         ext_headers: dict[str, str] | None = None,
     ):
-        """创建动态图片内容列表"""
         contents: list[DynamicContent] = []
         for url in dynamic_urls:
-            task = self.downloader.download_video(url, ext_headers=ext_headers or self.headers, proxy=self.proxy)
+            task = self.downloader.download_video(url, ext_headers=ext_headers or self.headers)
             contents.append(DynamicContent(task))
         return contents
 
@@ -266,12 +280,10 @@ class BaseParser:
         url_or_task: str | Task[Path],
         duration: float = 0.0,
     ):
-        """创建音频内容"""
         if isinstance(url_or_task, str):
             url_or_task = self.downloader.download_audio(
-                url_or_task, ext_headers=self.headers, proxy=self.proxy
+                url_or_task, ext_headers=self.headers
             )
-
         return AudioContent(url_or_task, duration)
 
     def create_graphics_content(
@@ -279,20 +291,19 @@ class BaseParser:
         image_url: str,
         text: str | None = None,
         alt: str | None = None,
+        ext_headers: dict[str, str] | None = None,
     ):
-        """创建图文内容 图片不能为空 文字可空 渲染时文字在前 图片在后"""
-        image_task = self.downloader.download_img(image_url, ext_headers=self.headers, proxy=self.proxy)
+        image_task = self.downloader.download_img(image_url, ext_headers=ext_headers or self.headers)
         return GraphicsContent(image_task, text, alt)
 
     def create_file_content(
         self,
         url_or_task: str | Task[Path],
         name: str | None = None,
+        ext_headers: dict[str, str] | None = None,
     ):
-        """创建文件内容"""
         if isinstance(url_or_task, str):
             url_or_task = self.downloader.download_file(
-                url_or_task, ext_headers=self.headers, file_name=name, proxy=self.proxy
+                url_or_task, ext_headers=ext_headers or self.headers, file_name=name
             )
-
         return FileContent(url_or_task)
