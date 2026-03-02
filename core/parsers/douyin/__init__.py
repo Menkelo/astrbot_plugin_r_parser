@@ -57,14 +57,29 @@ class DouyinParser(BaseParser):
     async def _parse_short_link(self, searched: re.Match[str]):
         short_url = f"https://{searched.group(0)}"
         final_url = await self.get_final_url(short_url, headers=self.ios_headers)
+
+        # 先按最终链接正常路由
         try:
             keyword, m = self.search_url(final_url)
-            return await self.parse(keyword, m)
         except Exception:
-            vid = extract_id_from_query(final_url)
-            if vid:
+            keyword, m = None, None
+
+        if keyword and m:
+            try:
+                return await self.parse(keyword, m)
+            except Exception as e:
+                # 这里不再直接吞掉，先记录真实原因，再走 ID 兜底
+                logger.warning(f"[Douyin] 短链路由后解析失败，尝试ID兜底: {e}")
+
+        # ID 兜底（已支持从 path 提取）
+        vid = extract_id_from_query(final_url)
+        if vid:
+            try:
                 return await self._parse_by_id_fallback(vid)
-            raise ParseException(f"短链解析失败，无法识别最终链接: {final_url}")
+            except Exception as e:
+                raise ParseException(f"短链解析失败，ID兜底失败: {e} | 最终链接: {final_url}")
+
+        raise ParseException(f"短链解析失败，无法识别最终链接: {final_url}")
 
     @handle("douyin", r"douyin\.com/(?P<ty>video|note)/(?P<vid>\d+)")
     @handle("iesdouyin", r"iesdouyin\.com/share/(?P<ty>slides|video|note)/(?P<vid>\d+)")
@@ -74,6 +89,7 @@ class DouyinParser(BaseParser):
         if ty == "slides":
             return await self.parse_slides(vid)
 
+        last_err: Exception | None = None
         for url in (
             f"https://www.douyin.com/{ty}/{vid}",
             self._build_m_douyin_url(ty, vid),
@@ -81,21 +97,31 @@ class DouyinParser(BaseParser):
         ):
             try:
                 return await self.parse_video(url, vid)
-            except Exception:
-                pass
+            except Exception as e:
+                last_err = e
+
+        logger.warning(f"[Douyin] 直连解析失败，切换 ytdlp 兜底: {last_err}")
         return await self._parse_with_ytdlp(vid)
 
     async def _parse_by_id_fallback(self, vid: str):
+        last_err: Exception | None = None
         for ty in ("video", "note"):
             for u in (self._build_m_douyin_url(ty, vid), self._build_iesdouyin_url(ty, vid)):
                 try:
                     return await self.parse_video(u, vid)
-                except Exception:
-                    pass
+                except Exception as e:
+                    last_err = e
+        logger.warning(f"[Douyin] _parse_by_id_fallback 失败，切换 ytdlp: {last_err}")
         return await self._parse_with_ytdlp(vid)
 
     async def parse_video(self, url: str, vid: str):
-        resp = await self.client.get(url, headers=self.ios_headers, allow_redirects=True, verify=False)
+        # 关键：用 http_get，自动 curl->aiohttp 兜底
+        resp = await self.http_get(
+            url,
+            headers=self.ios_headers,
+            allow_redirects=True,
+            timeout=20,
+        )
         if resp.status_code != 200:
             raise ParseException(f"页面请求失败 Status: {resp.status_code}")
 
@@ -125,13 +151,17 @@ class DouyinParser(BaseParser):
             author = self.create_author(meta.author.nickname, meta.avatar_url, ext_headers=self.ios_headers)
             return self.result(title=meta.desc, author=author, contents=contents, timestamp=meta.create_time)
 
-        # 普通图/视频分支（按你原逻辑接回去）
+        # 普通图/视频
         meta = msgspec.convert(aweme, VideoData)
         contents = []
         if meta.images and meta.image_urls:
             contents.extend(self.create_image_contents(meta.image_urls))
         elif meta.video_url:
-            task = self.downloader.download_video(meta.video_url, video_name=f"douyin_{meta.id or vid}.mp4", ext_headers=self.ios_headers)
+            task = self.downloader.download_video(
+                meta.video_url,
+                video_name=f"douyin_{meta.id or vid}.mp4",
+                ext_headers=self.ios_headers,
+            )
             contents.append(self.create_video_content(task, None, meta.video.duration if meta.video else 0))
 
         author = self.create_author(meta.author.nickname, meta.avatar_url, ext_headers=self.ios_headers)
@@ -140,7 +170,15 @@ class DouyinParser(BaseParser):
     async def parse_slides(self, video_id: str):
         url = "https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/"
         params = {"aweme_ids": f"[{video_id}]", "request_source": "200"}
-        resp = await self.client.get(url, params=params, headers=self.android_headers, verify=False)
+
+        # 关键：用 http_get，自动 curl->aiohttp 兜底
+        resp = await self.http_get(
+            url,
+            params=params,
+            headers=self.android_headers,
+            allow_redirects=True,
+            timeout=20,
+        )
         if resp.status_code >= 400:
             raise ParseException(f"API Error: {resp.status_code}")
 
@@ -174,4 +212,11 @@ class DouyinParser(BaseParser):
             task = self.downloader.download_video(url, use_ytdlp=True, video_name=f"douyin_{vid}.mp4")
             contents.append(VideoContent(task, None, duration=info.duration))
         author = self.create_author(info.uploader or "抖音用户")
-        return self.result(title=info.title or "抖音视频", text=info.description or "", author=author, contents=contents, timestamp=info.timestamp, url=url)
+        return self.result(
+            title=info.title or "抖音视频",
+            text=info.description or "",
+            author=author,
+            contents=contents,
+            timestamp=info.timestamp,
+            url=url,
+        )
