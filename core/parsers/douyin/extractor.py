@@ -3,15 +3,42 @@ from urllib.parse import parse_qs, urlparse
 
 
 def extract_id_from_query(url: str) -> str | None:
+    """
+    兼容旧函数名：
+    - 先查 query
+    - 再查 path（关键修复）
+    """
     try:
-        query = parse_qs(urlparse(url).query)
+        p = urlparse(url)
+        query = parse_qs(p.query)
     except Exception:
         return None
+
+    # 1) query 参数里取
     for key in ("modal_id", "aweme_id", "item_id", "video_id", "note_id", "id"):
         vals = query.get(key) or []
         for v in vals:
             if v and str(v).isdigit():
                 return str(v)
+
+    # 2) path 里取（关键补充）
+    path = p.path or ""
+
+    # /share/video/761226...
+    m = re.search(r"/share/(?:video|note|slides)/(\d+)", path)
+    if m:
+        return m.group(1)
+
+    # /video/761226... 或 /note/761226...
+    m = re.search(r"/(?:video|note)/(\d+)", path)
+    if m:
+        return m.group(1)
+
+    # 兜底：路径最后一个纯数字段
+    m = re.search(r"/(\d+)(?:/)?$", path)
+    if m:
+        return m.group(1)
+
     return None
 
 
