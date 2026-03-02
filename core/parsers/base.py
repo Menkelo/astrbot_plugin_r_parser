@@ -1,3 +1,5 @@
+import asyncio
+import socket
 from abc import ABC
 from asyncio import Task
 from collections.abc import Callable, Coroutine
@@ -5,9 +7,7 @@ from pathlib import Path
 from re import Match, Pattern, compile
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar, List, Dict
 
-# === 新增：引入 aiohttp 用于兜底 ===
 import aiohttp
-
 from curl_cffi.requests import AsyncSession
 from typing_extensions import Unpack
 from astrbot.api import logger
@@ -38,7 +38,7 @@ _PARSER_META = "_parser_meta"
 
 
 def handle(keyword: str, pattern: str):
-    """注册处理器装饰器"""
+    """娉ㄥ唽澶勭悊鍣ㄨ�楗板櫒"""
     def decorator(func: HandlerFunc[T]) -> HandlerFunc[T]:
         if not hasattr(func, _PARSER_META):
             setattr(func, _PARSER_META, [])
@@ -49,7 +49,7 @@ def handle(keyword: str, pattern: str):
 
 
 class BaseParser:
-    """所有平台 Parser 的抽象基类"""
+    """鎵€鏈夊钩鍙� Parser 鐨勬娊璞″熀绫�"""
 
     _registry: ClassVar[list[type["BaseParser"]]] = []
     platform: ClassVar[Platform]
@@ -108,10 +108,10 @@ class BaseParser:
             self._session = None
 
     async def parse(self, keyword: str, searched: Match[str]) -> ParseResult:
-        """解析 URL 提取信息"""
+        """瑙ｆ瀽 URL 鎻愬彇淇℃伅"""
         method_name = self._dispatch_map.get(keyword)
         if not method_name:
-            raise ParseException(f"未找到关键词 {keyword} 对应的处理方法")
+            raise ParseException(f"鏈�壘鍒板叧閿�瘝 {keyword} 瀵瑰簲鐨勫�鐞嗘柟娉�")
 
         handler = getattr(self, method_name)
         return await handler(searched)
@@ -123,7 +123,7 @@ class BaseParser:
     ) -> ParseResult:
         redirect_url = await self.get_redirect_url(url, headers=headers or self.headers)
         if redirect_url == url:
-            raise ParseException(f"无法重定向 URL: {url}")
+            raise ParseException(f"鏃犳硶閲嶅畾鍚� URL: {url}")
         keyword, searched = self.search_url(redirect_url)
         return await self.parse(keyword, searched)
 
@@ -134,7 +134,7 @@ class BaseParser:
                 continue
             if searched := pattern.search(url):
                 return keyword, searched
-        raise ParseException(f"无法匹配 {url}")
+        raise ParseException(f"鏃犳硶鍖归厤 {url}")
 
     @classmethod
     def result(cls, **kwargs: Unpack[ParseResultKwargs]) -> ParseResult:
@@ -150,44 +150,80 @@ class BaseParser:
         timeout: int = 15,
     ):
         """
-        统一 GET 请求入口:
-        优先 curl_cffi；失败自动降级 aiohttp。
-        返回对象兼容常用字段: status_code / headers / url / text / content
+        缁熶竴 GET 璇锋眰鍏ュ彛:
+        1) 浼樺厛 curl_cffi锛堝甫閲嶈瘯锛�
+        2) 澶辫触鍚庨檷绾� aiohttp锛堝己鍒禝Pv4 + 閲嶈瘯锛�
+        杩斿洖瀵硅薄鍏煎�瀛楁�: status_code / headers / url / text / content
         """
         headers = headers or self.headers
-        try:
-            return await self.client.get(
-                url,
-                headers=headers,
-                params=params,
-                allow_redirects=allow_redirects,
-                timeout=timeout,
-                verify=False,
-            )
-        except Exception as e:
-            logger.warning(f"curl_cffi GET失败，尝试aiohttp兜底: {e}")
-            conn = aiohttp.TCPConnector(ssl=False)
-            async with aiohttp.ClientSession(
-                connector=conn,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-                headers=headers,
-            ) as session:
-                async with session.get(
+        retries = 3
+
+        # 绗�竴灞傦細curl_cffi 閲嶈瘯
+        last_curl_err: Exception | None = None
+        for i in range(retries):
+            try:
+                return await self.client.get(
                     url,
+                    headers=headers,
                     params=params,
                     allow_redirects=allow_redirects,
-                ) as resp:
-                    body = await resp.read()
+                    timeout=timeout,
+                    verify=False,
+                )
+            except Exception as e:
+                last_curl_err = e
+                if i < retries - 1:
+                    await asyncio.sleep(0.25 * (i + 1))
 
-                    class _Resp:
-                        def __init__(self):
-                            self.status_code = resp.status
-                            self.headers = dict(resp.headers)
-                            self.url = str(resp.url)
-                            self.content = body
-                            self.text = body.decode(errors="ignore")
+        logger.warning(f"curl_cffi GET澶辫触锛屽皾璇昦iohttp鍏滃簳: {last_curl_err}")
 
-                    return _Resp()
+        # 绗�簩灞傦細aiohttp 寮哄埗 IPv4 + 閲嶈瘯
+        last_aio_err: Exception | None = None
+        for i in range(retries):
+            conn = aiohttp.TCPConnector(
+                ssl=False,
+                family=socket.AF_INET,   # 寮哄埗 IPv4
+                ttl_dns_cache=300,
+                use_dns_cache=True,
+            )
+            timeout_conf = aiohttp.ClientTimeout(
+                total=timeout,
+                connect=min(10, timeout),
+                sock_connect=min(10, timeout),
+                sock_read=timeout,
+            )
+
+            try:
+                async with aiohttp.ClientSession(
+                    connector=conn,
+                    timeout=timeout_conf,
+                    headers=headers,
+                ) as session:
+                    async with session.get(
+                        url,
+                        params=params,
+                        allow_redirects=allow_redirects,
+                    ) as resp:
+                        body = await resp.read()
+
+                        class _Resp:
+                            def __init__(self, _resp, _body: bytes):
+                                self.status_code = _resp.status
+                                self.headers = dict(_resp.headers)
+                                self.url = str(_resp.url)
+                                self.content = _body
+                                self.text = _body.decode(errors="ignore")
+
+                        return _Resp(resp, body)
+
+            except Exception as e:
+                last_aio_err = e
+                if i < retries - 1:
+                    await asyncio.sleep(0.35 * (i + 1))
+            finally:
+                await conn.close()
+
+        raise ParseException(f"HTTP GET澶辫触(curl+aiohttp): {last_aio_err or last_curl_err}")
 
     async def get_redirect_url(
         self,
@@ -206,7 +242,7 @@ class BaseParser:
                 raise ParseException(f"redirect check {resp.status_code}")
             return resp.headers.get("Location", url)
         except Exception as e:
-            raise ParseException(f"重定向检测失败: {e}")
+            raise ParseException(f"閲嶅畾鍚戞�娴嬪け璐�: {e}")
 
     async def get_final_url(
         self,
@@ -227,7 +263,7 @@ class BaseParser:
 
     async def get_search_data(self, keyword: str) -> List[Dict[str, Any]]:
         """
-        搜索接口，返回标准化的结果列表
+        鎼滅储鎺ュ彛锛岃繑鍥炴爣鍑嗗寲鐨勭粨鏋滃垪琛�
         """
         return []
 
