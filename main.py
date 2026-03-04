@@ -3,11 +3,8 @@ nest_asyncio.apply()
 
 import asyncio
 import re
-import os
 from concurrent.futures import ThreadPoolExecutor
-from itertools import chain
 from pathlib import Path
-from typing import Optional
 
 from astrbot.api import logger
 from astrbot.api.event import filter
@@ -34,15 +31,13 @@ from .core.arbiter import EmojiLikeArbiter
 from .core.clean import CacheCleaner
 from .core.data import (
     AudioContent,
-    Author,
     DynamicContent,
     FileContent,
     GraphicsContent,
     ImageContent,
+    MediaContent,
     ParseResult,
-    Platform,
     VideoContent,
-    MediaContent
 )
 from .core.download import Downloader
 from .core.exception import (
@@ -52,10 +47,7 @@ from .core.exception import (
     SizeLimitException,
     ZeroSizeException,
 )
-from .core.parsers import (
-    BaseParser,
-    BilibiliParser,
-)
+from .core.parsers import BaseParser
 from .core.utils import extract_json_url, exec_ffmpeg_cmd
 
 
@@ -111,15 +103,10 @@ class ParserPlugin(Star):
         patterns.sort(key=lambda x: -len(x[0]))
         self.key_pattern_list = patterns
 
-    def _get_parser_by_type(self, parser_type):
-        for parser in self.parser_map.values():
-            if isinstance(parser, parser_type):
-                return parser
-        raise ValueError(f"未找到类型为 {parser_type.__name__} 的 parser 实例")
-
     # endregion
 
     # region 核心逻辑 (Download / Convert / Send)
+
     async def _download_content(self, cont: MediaContent) -> tuple[MediaContent, Path | None, str | None]:
         try:
             path = await cont.get_path()
@@ -179,9 +166,11 @@ class ParserPlugin(Star):
         async def process_main_content():
             if not result.contents:
                 return
+
             tasks = [self._download_content(c) for c in result.contents]
             download_results = await asyncio.gather(*tasks)
             path_map = {id(c): (p, err) for c, p, err in download_results}
+
             segs = []
             for cont in result.contents:
                 path, error = path_map.get(id(cont), (None, None))
@@ -200,30 +189,34 @@ class ParserPlugin(Star):
                     await event.send(event.plain_result(msg.strip()))
                 return
 
-            has_video = any(isinstance(c, (VideoContent, DynamicContent)) for c in result.contents)
+            # 关键：允许 parser 强制直发媒体（用于空间渲染图）
+            force_direct_media = bool(result.extra.get("force_direct_media", False))
+            if force_direct_media:
+                for seg in segs:
+                    await event.send(event.chain_result([seg]))
+                return
+
             has_video = any(isinstance(c, (VideoContent, DynamicContent)) for c in result.contents)
             if has_video:
-                # 多媒体（尤其多视频）优先使用合并转发，避免平台只吞第一个视频
                 media_count = sum(1 for s in segs if isinstance(s, (Video, Image, File, Record)))
                 if media_count >= 2:
                     try:
                         nodes = Nodes([])
-                        for i, seg in enumerate(segs, start=1):
-                            # 可选：每个节点加个序号提示
-                            # nodes.nodes.append(Node(uin=node_uin, name=node_name, content=[Plain(f"[{i}/{len(segs)}]")]))
+                        for seg in segs:
                             nodes.nodes.append(Node(uin=node_uin, name=node_name, content=[seg]))
                         await event.send(event.chain_result([nodes]))
                         return
                     except Exception as e:
                         logger.warning(f"合并转发发送失败，降级逐条发送: {e}")
 
-                # 降级：逐条发（防止一次 chain 多视频只发第一个）
                 for seg in segs:
                     try:
                         await event.send(event.chain_result([seg]))
                     except Exception as e:
                         err_msg = str(e)
-                        if isinstance(seg, Video) and ("rich media" in err_msg or "1200" in err_msg or "Timeout" in err_msg):
+                        if isinstance(seg, Video) and (
+                            "rich media" in err_msg or "1200" in err_msg or "Timeout" in err_msg
+                        ):
                             logger.warning("视频发送失败(编码不兼容/超时)，尝试转码 H.264 重试...")
                             path_str = getattr(seg, "file", None)
                             if path_str:
@@ -240,8 +233,15 @@ class ParserPlugin(Star):
                                 except Exception:
                                     pass
 
-                        await event.send(event.plain_result(f"⚠️ 媒体发送失败\n🔗 原链接: {result.url or '未知'}"))
+                        await event.send(
+                            event.plain_result(f"⚠️ 媒体发送失败\n🔗 原链接: {result.url or '未知'}")
+                        )
             else:
+                # 关键：非视频场景，单媒体直发，避免默认转发
+                if len(segs) == 1:
+                    await event.send(event.chain_result([segs[0]]))
+                    return
+
                 nodes = Nodes([])
                 for seg in segs:
                     nodes.nodes.append(Node(uin=node_uin, name=node_name, content=[seg]))
@@ -256,12 +256,14 @@ class ParserPlugin(Star):
             path_map = {id(c): (p, err) for c, p, err in download_results}
             segs = []
             for cont in result.comment_contents:
-                path, error = path_map.get(id(cont), (None, None))
+                path, _ = path_map.get(id(cont), (None, None))
                 if path:
                     if seg := self._convert_to_seg(cont, path):
                         segs.append(seg)
+
             if not segs:
                 return
+
             nodes = Nodes([])
             nodes.nodes.append(Node(uin=node_uin, name=node_name, content=[Plain("评论区↓")]))
             for seg in segs:
@@ -269,6 +271,7 @@ class ParserPlugin(Star):
             await event.send(event.chain_result([nodes]))
 
         await asyncio.gather(process_main_content(), process_comment_content())
+
     # endregion
 
     # region 事件监听
@@ -296,7 +299,6 @@ class ParserPlugin(Star):
 
         prefixes = self.context.get_config().get("command_prefixes", ["/"])
         is_command = any(text.startswith(p) for p in prefixes)
-
         if is_command:
             return
 
@@ -305,7 +307,6 @@ class ParserPlugin(Star):
         if chain and isinstance(chain[0], At) and str(chain[0].qq) != self_id:
             return
 
-        # === 改动：支持同一条消息内多个链接 ===
         matches: list[tuple[int, str, re.Match[str]]] = []
         for kw, pat in self.key_pattern_list:
             if kw not in text:
