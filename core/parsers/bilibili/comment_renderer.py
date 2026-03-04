@@ -104,11 +104,16 @@ class BiliCommentRenderer:
             }}
             .img-box {{
               margin-top: 12px;
+              background: #f7f8fa;
+              border-radius: 8px;
+              overflow: hidden;
             }}
             .img-box img {{
               width: 100%;
-              max-height: 450px;
-              object-fit: cover;
+              height: auto;          /* 关键：按比例完整显示 */
+              max-height: none;      /* 去掉高度裁切 */
+              object-fit: contain;   /* 关键：不裁图 */
+              display: block;
               border-radius: 8px;
             }}
             .footer {{

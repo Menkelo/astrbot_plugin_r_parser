@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from pathlib import Path
 from re import Match
@@ -15,16 +16,14 @@ from ...constants import BILIBILI_HEADER
 from ...data import MediaContent, Platform
 from ...exception import SizeLimitException
 from ...utils import ck2dict
-from ..base import (
-    BaseParser,
-    Downloader,
-    ParseException,
-    handle,
-)
+from ..base import BaseParser, Downloader, ParseException, handle
 
-# 你前面已经拆分过评论与码率模块，这里直接复用
 from .comment_renderer import BiliCommentRenderer
 from .comment_service import BiliCommentService
+from .live_renderer import BiliLiveRenderer
+from .live_service import BiliLiveService
+from .space_renderer import BiliSpaceRenderer  # ✅ 最小修补：补回导入
+from .space_service import BiliSpaceService
 from .stream_selector import BiliStreamSelector
 
 
@@ -46,13 +45,11 @@ class BilibiliParser(BaseParser):
         self.comment_limit = 9
         self.max_size_mb = config.get("performance", {}).get("source_max_size", 90)
 
-        # 轻量缓存（提速）
         perf = config.get("performance", {})
         self._cache_ttl = int(perf.get("bili_cache_ttl", 120))
         self._video_info_cache: dict[str, tuple[float, dict]] = {}
         self._playurl_cache: dict[str, tuple[float, dict]] = {}
 
-        # 评论过滤配置
         comment_conf = config.get("comment_filter", {})
         if not isinstance(comment_conf, dict):
             comment_conf = {}
@@ -68,38 +65,82 @@ class BilibiliParser(BaseParser):
             qr_check_timeout=float(comment_conf.get("qr_check_timeout", 6)),
         )
         self.stream_selector = BiliStreamSelector()
+        self.live_renderer = BiliLiveRenderer()
+        self.space_renderer = BiliSpaceRenderer()  # ✅ 最小修补：补回初始化
+
+        # 分层服务
+        self.space_service = BiliSpaceService(self)
+        self.live_service = BiliLiveService(self)
 
     # region 路由处理
 
-    @handle("b23.tv", r"b23\.tv/[A-Za-z\d\._?%&+\-=/#]+")
-    @handle("bili2233", r"bili2233\.cn/[A-Za-z\d\._?%&+\-=/#]+")
+    @handle("b23.tv", r"(?:https?://)?b23\.tv/[A-Za-z\d\._?%&+\-=/#]+")
+    @handle("bili2233", r"(?:https?://)?bili2233\.cn/[A-Za-z\d\._?%&+\-=/#]+")
     async def _parse_short_link(self, searched: Match[str]):
-        url = f"https://{searched.group(0)}"
+        raw = searched.group(0)
+        url = raw if raw.startswith(("http://", "https://")) else f"https://{raw}"
         return await self.parse_with_redirect(url)
 
     @handle("BV", r"^(?P<bvid>BV[0-9a-zA-Z]{10})(?:\s)?(?P<page_num>\d{1,3})?$")
-    @handle("/BV", r"bilibili\.com(?:/video)?/(?P<bvid>BV[0-9a-zA-Z]{10})(?:\?p=(?P<page_num>\d{1,3}))?")
+    @handle(
+        "/BV",
+        r"(?:https?://)?(?:www\.|m\.)?bilibili\.com/(?:video/)?(?P<bvid>BV[0-9a-zA-Z]{10})(?:[/?#][^\s]*)?",
+    )
     async def _parse_bv(self, searched: Match[str]):
         bvid = str(searched.group("bvid"))
-        page_num = int(searched.group("page_num") or 1)
+        page_num = int((searched.groupdict().get("page_num") or 1))
+        if page_num == 1:
+            m = re.search(r"[?&]p=(\d{1,3})", searched.group(0))
+            if m:
+                page_num = int(m.group(1))
         return await self.parse_video(bvid=bvid, page_num=page_num)
 
     @handle("av", r"^av(?P<avid>\d{6,})(?:\s)?(?P<page_num>\d{1,3})?$")
-    @handle("/av", r"bilibili\.com(?:/video)?/av(?P<avid>\d{6,})(?:\?p=(?P<page_num>\d{1,3}))?")
+    @handle(
+        "/av",
+        r"(?:https?://)?(?:www\.|m\.)?bilibili\.com/(?:video/)?av(?P<avid>\d{6,})(?:[/?#][^\s]*)?",
+    )
     async def _parse_av(self, searched: Match[str]):
         avid = int(searched.group("avid"))
-        page_num = int(searched.group("page_num") or 1)
+        page_num = int((searched.groupdict().get("page_num") or 1))
+        if page_num == 1:
+            m = re.search(r"[?&]p=(\d{1,3})", searched.group(0))
+            if m:
+                page_num = int(m.group(1))
         return await self.parse_video(avid=avid, page_num=page_num)
 
-    @handle("t.bili", r"t\.bilibili\.com/(?P<dynamic_id>\d+)")
+    @handle("t.bili", r"(?:https?://)?t\.bilibili\.com/(?P<dynamic_id>\d+)(?:[/?#][^\s]*)?")
     async def _parse_dynamic(self, searched: Match[str]):
-        dynamic_id = int(searched.group("dynamic_id"))
-        return await self.parse_dynamic(dynamic_id)
+        return await self.parse_dynamic(int(searched.group("dynamic_id")))
 
-    @handle("opus", r"bilibili\.com/opus/(?P<dynamic_id>\d+)")
+    @handle(
+        "opus",
+        r"(?:https?://)?(?:www\.|m\.)?bilibili\.com/opus/(?P<dynamic_id>\d+)(?:[/?#][^\s]*)?",
+    )
     async def _parse_opus(self, searched: Match[str]):
-        dynamic_id = int(searched.group("dynamic_id"))
-        return await self.parse_dynamic(dynamic_id)
+        return await self.parse_dynamic(int(searched.group("dynamic_id")))
+
+    @handle(
+        "space.bilibili.com/",
+        r"(?:https?://)?space\.bilibili\.com/(?P<mid>\d+)(?:\?[^\s#]*)?(?:#[^\s]*)?",
+    )
+    @handle(
+        "m.bilibili.com/space/",
+        r"(?:https?://)?m\.bilibili\.com/space/(?P<mid>\d+)(?:\?[^\s#]*)?(?:#[^\s]*)?",
+    )
+    @handle(
+        "bilibili.com/space/",
+        r"(?:https?://)?(?:www\.)?bilibili\.com/space/(?P<mid>\d+)(?:\?[^\s#]*)?(?:#[^\s]*)?",
+    )
+    async def _parse_space(self, searched: Match[str]):
+        return await self.parse_space(int(searched.group("mid")))
+
+    @handle(
+        "live.bilibili.com/",
+        r"(?:https?://)?live\.bilibili\.com/(?P<room_id>\d+)(?:\?[^\s#]*)?(?:#[^\s]*)?",
+    )
+    async def _parse_live(self, searched: Match[str]):
+        return await self.parse_live(int(searched.group("room_id")))
 
     # endregion
 
@@ -134,12 +175,11 @@ class BilibiliParser(BaseParser):
 
     # endregion
 
-    # region CDN候选增强（关键修复）
+    # region CDN候选
 
     @staticmethod
     def _collect_stream_urls(item: dict) -> list[str]:
         urls: list[str] = []
-
         base = item.get("baseUrl") or item.get("base_url")
         if isinstance(base, str) and base:
             urls.append(base)
@@ -150,7 +190,6 @@ class BilibiliParser(BaseParser):
                 if isinstance(u, str) and u:
                     urls.append(u)
 
-        # 去重保序
         seen = set()
         uniq = []
         for u in urls:
@@ -158,19 +197,13 @@ class BilibiliParser(BaseParser):
                 seen.add(u)
                 uniq.append(u)
 
-        # 优先非 mcdn / 非 8082
         def score(u: str) -> tuple[int, int]:
-            bad_port = 1 if ":8082" in u else 0
-            bad_host = 1 if "mcdn" in u else 0
-            return (bad_port, bad_host)
+            return (1 if ":8082" in u else 0, 1 if "mcdn" in u else 0)
 
         uniq.sort(key=score)
         return uniq
 
     def _select_best_stream_candidates(self, data: dict, duration: int, limit_mb: int) -> tuple[list[str], list[str]]:
-        """
-        返回 (video_candidates, audio_candidates)
-        """
         if "dash" not in data:
             if "durl" in data and data["durl"]:
                 u = data["durl"][0].get("url")
@@ -194,10 +227,9 @@ class BilibiliParser(BaseParser):
             audio_size_mb = (bandwidth / 8 * duration) / 1024 / 1024
 
         remaining_mb = max(limit_mb - audio_size_mb, 0)
-
         video_streams.sort(key=lambda x: x.get("id", 0), reverse=True)
-        selected_item = None
 
+        selected_item = None
         for v in video_streams:
             bandwidth = v.get("bandwidth", 0)
             est_size_mb = (bandwidth / 8 * duration) / 1024 / 1024
@@ -208,8 +240,7 @@ class BilibiliParser(BaseParser):
         if selected_item is None:
             selected_item = video_streams[-1]
 
-        video_candidates = self._collect_stream_urls(selected_item)
-        return video_candidates, audio_candidates
+        return self._collect_stream_urls(selected_item), audio_candidates
 
     # endregion
 
@@ -240,11 +271,7 @@ class BilibiliParser(BaseParser):
         url = f"https://bilibili.com/{video_info.bvid}"
         url += f"?p={page_info.index + 1}" if page_info.index > 0 else ""
 
-        limit_mb = self.max_size_mb
-
-        task_play_url = self._get_playurl_cached(
-            video, page_info.index, f"{video_info.bvid}:{page_info.index}"
-        )
+        task_play_url = self._get_playurl_cached(video, page_info.index, f"{video_info.bvid}:{page_info.index}")
         task_comments = self.comment_service.build_comment_image_content(
             video_info.aid,
             1,
@@ -254,28 +281,20 @@ class BilibiliParser(BaseParser):
         play_url_data, comment_imgs = await asyncio.gather(task_play_url, task_comments)
 
         v_candidates, a_candidates = self._select_best_stream_candidates(
-            play_url_data, page_info.duration, limit_mb
+            play_url_data, page_info.duration, self.max_size_mb
         )
-
         if not v_candidates:
-            raise SizeLimitException(f"即使是最低画质也超过了限制 ({limit_mb}MB)")
+            raise SizeLimitException(f"即使是最低画质也超过了限制 ({self.max_size_mb}MB)")
 
         async def download_video_task():
             output_path = self.cache_dir / f"{video_info.bvid}-{page_num}.mp4"
-            if output_path.exists():
-                if output_path.stat().st_size > 100:
-                    return output_path
-                try:
-                    output_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+            if output_path.exists() and output_path.stat().st_size > 100:
+                return output_path
 
-            download_headers = self.headers.copy()
-            download_headers["Referer"] = url
-
+            headers = self.headers.copy()
+            headers["Referer"] = url
             last_err: Exception | None = None
 
-            # 先尝试音视频合并候选
             if a_candidates:
                 for v_url in v_candidates:
                     for a_url in a_candidates:
@@ -284,25 +303,22 @@ class BilibiliParser(BaseParser):
                                 v_url,
                                 a_url,
                                 output_path=output_path,
-                                ext_headers=download_headers,
-                                max_size_mb=limit_mb,
+                                ext_headers=headers,
+                                max_size_mb=self.max_size_mb,
                             )
                         except Exception as e:
                             last_err = e
-                            continue
 
-            # 再尝试纯视频候选
             for v_url in v_candidates:
                 try:
                     return await self.downloader.streamd(
                         v_url,
                         file_name=output_path.name,
-                        ext_headers=download_headers,
-                        max_size_mb=limit_mb,
+                        ext_headers=headers,
+                        max_size_mb=self.max_size_mb,
                     )
                 except Exception as e:
                     last_err = e
-                    continue
 
             raise ParseException(f"B站媒体下载失败（已尝试全部CDN候选）: {last_err}")
 
@@ -343,6 +359,12 @@ class BilibiliParser(BaseParser):
             author=author,
             contents=contents,
         )
+
+    async def parse_space(self, mid: int):
+        return await self.space_service.parse_space(mid)
+
+    async def parse_live(self, room_id: int):
+        return await self.live_service.parse_live(room_id)
 
     async def _get_video(self, *, bvid: str | None = None, avid: int | None = None) -> Video:
         if avid:
